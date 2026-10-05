@@ -26,9 +26,9 @@ jobs:
       run: |
         git rm -rf --cached KernelSU || true
         rm -rf KernelSU .git/modules/KernelSU
-        curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+        curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
 
-        git submodule add https://github.com/ReSukiSU/ReSukiSU.git KernelSU
+        git submodule add https://github.com/Baka-SU/BakaSU.git KernelSU
 
         grep -q 'path = KernelSU' .gitmodules
         git submodule status
