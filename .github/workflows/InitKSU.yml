@@ -24,20 +24,17 @@ jobs:
 
     - name: Run ReSukiSU Setup
       run: |
-        rm -rf KernelSU
+        git rm -rf KernelSU || true
+        rm -rf KernelSU .git/modules/KernelSU
         curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
-
-        git rm -r --cached KernelSU || true
-        find KernelSU -name ".git" -exec rm -rf {} + || true
 
     - name: Commit and Push
       run: |
         git add -A
-        
         if git diff --cached --quiet; then
           echo "No changes detected."
         else
-          git commit -m "kernel: update ResukiSU source"
-          git push origin 4.14.200-p
+          git commit -m "kernel: update ReSukiSU source"
+          git push origin 4.14.200
         fi
         
