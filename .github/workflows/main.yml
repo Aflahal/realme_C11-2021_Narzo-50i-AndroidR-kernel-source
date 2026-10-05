@@ -260,6 +260,7 @@ jobs:
 
              if [ "$KO_NAME" = "pvrsrvkm" ]; then
               MAKE_CMD="$MAKE_CMD \
+              BUILD=release
               TARGET_BOARD_PLATFORM=\"${{ env.TARGET_BOARD_PLATFORM }}\" \
               TARGET_BOARD=\"${{ env.TARGET_BOARD }}\" \
               TARGET_KERNEL_ARCH=\"${{ env.TARGET_KERNEL_ARCH }}\" \
