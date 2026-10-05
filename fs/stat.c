@@ -365,6 +365,23 @@ extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **sta
 #endif
 #endif
 
+#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
+SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
+		struct stat __user *, statbuf, int, flag)
+{
+	struct kstat stat;
+	int error;
+
+#ifdef CONFIG_KSU_MANUAL_HOOK
+	ksu_handle_stat(&dfd, &filename, &flag);
+#endif
+
+	error = vfs_fstatat(dfd, filename, &stat, flag);
+	if (error)
+		return error;
+	return cp_new_stat(&stat, statbuf);
+}
+#endif
 
 SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
 {
