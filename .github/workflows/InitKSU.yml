@@ -35,6 +35,6 @@ jobs:
           echo "No changes detected."
         else
           git commit -m "kernel: update ReSukiSU source"
-          git push origin 4.14.200
+          git push origin 4.14.200-p
         fi
         
