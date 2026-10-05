@@ -2595,7 +2595,7 @@ pub fn patch_boot(args: &BootPatchV2Args) -> Result<()> {
         let name = embedded_module_name(&kmi);
         println!("- KMI: {kmi}");
         println!("- Embedded module: {name}");
-        assets::get_asset_data(&name)
+        assets::get_asset(&name)
             .with_context(|| format!("no embedded KernelSU module for KMI {kmi}: {name}"))?
             .into_owned()
     };

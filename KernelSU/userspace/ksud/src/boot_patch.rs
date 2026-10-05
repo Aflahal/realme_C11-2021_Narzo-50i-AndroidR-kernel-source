@@ -1,40 +1,57 @@
-#![allow(clippy::ref_option, clippy::needless_pass_by_value)]
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::{
+    fs::File,
+    io::{Cursor, Seek, SeekFrom},
+    path::PathBuf,
+};
 
-use std::fs::File;
-use std::io::{Cursor, Seek, SeekFrom};
-use std::path::Path;
-use std::path::PathBuf;
-
-use android_bootimg::cpio::{Cpio, CpioEntry};
-use android_bootimg::parser::{BootImage, BootImageVersion, RamdiskImage};
-use android_bootimg::patcher::BootImagePatchOption;
-use anyhow::Context;
-use anyhow::Result;
-use anyhow::anyhow;
-use anyhow::bail;
-use anyhow::ensure;
+use android_bootimg::{
+    cpio::{Cpio, CpioEntry},
+    parser::{BootImage, BootImageVersion, RamdiskImage},
+    patcher::BootImagePatchOption,
+};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use memmap2::{Mmap, MmapOptions};
 use regex_lite::Regex;
 
-use crate::assets;
+use crate::{assets, banner};
+
+const KSU_BLOCK_MODULES_CONFIG: &str = "ksu_block_modules";
+const KSU_BLOCK_MODULES_MAX_LEN: usize = 255;
+
+fn valid_block_modules(modules: &str) -> bool {
+    modules.len() <= KSU_BLOCK_MODULES_MAX_LEN
+        && (modules.is_empty()
+            || modules.split(',').all(|name| {
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'-')
+            }))
+}
 
 #[cfg(target_os = "android")]
 mod android {
-    use super::Result;
-    pub(super) use crate::defs::{BACKUP_FILENAME, KSU_BACKUP_DIR, KSU_BACKUP_FILE_PREFIX};
-    use crate::defs::{DEFAULT_PACKAGE_NAME, KSU_TEMP_BACKUP_DIR_NAME};
+    use rustix::process::getuid;
+    use std::{
+        fs::{File, OpenOptions},
+        io::Write,
+        os::fd::AsRawFd,
+        path::{Path, PathBuf},
+        process::Command,
+    };
+
     use android_bootimg::cpio::{Cpio, CpioEntry};
     use anyhow::{Context, anyhow, bail, ensure};
     use regex_lite::Regex;
-    use rustix::process::getuid;
-    use std::fs::{File, OpenOptions};
-    use std::io::Write;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
 
-    use crate::utils;
+    use super::{PermissionsExt, Result};
+    use crate::android::utils;
+    pub(super) use crate::defs::{
+        BACKUP_FILENAME, DEFAULT_PACKAGE_NAME, KSU_BACKUP_DIR, KSU_BACKUP_FILE_PREFIX,
+        KSU_TEMP_BACKUP_DIR_NAME,
+    };
 
     pub(super) fn ensure_gki_kernel() -> Result<()> {
         let version = get_kernel_version()?;
@@ -151,7 +168,6 @@ mod android {
         {
             return Ok((file, backup_file));
         }
-
         bail!("Both /data/adb/ksu and {backup_dir} are not accessible!")
     }
 
@@ -159,6 +175,7 @@ mod android {
         let sha1 = calculate_sha1(image)?;
         let (mut target_file, target) = find_backup_location(&sha1)?;
         println!("- Backup stock boot image");
+
         let mut source = OpenOptions::new()
             .create(false)
             .truncate(false)
@@ -166,9 +183,8 @@ mod android {
             .write(false)
             .open(image)?;
 
-        // Use io::copy instead of fs::copy to allow copy block device
         std::io::copy(&mut source, &mut target_file)
-            .with_context(|| format!("failed to backup to {target}"))?;
+            .with_context(|| format!("backup to {target}"))?;
 
         let backup_file = CpioEntry::regular(0o755, Box::new(sha1));
         cpio.add(BACKUP_FILENAME, backup_file)?;
@@ -218,6 +234,7 @@ mod android {
         Ok(())
     }
 
+    #[allow(clippy::ref_option)]
     pub fn choose_boot_partition(
         kmi: &str,
         is_replace_kernel: bool,
@@ -277,9 +294,9 @@ mod android {
         PathBuf::from(format!("/dev/block/by-name/{name}{slot_suffix}"))
     }
 
+    #[cfg(target_os = "android")]
     pub(super) fn post_ota() -> Result<()> {
-        use crate::assets::BOOTCTL_PATH;
-        use crate::defs::ADB_DIR;
+        use crate::{assets::BOOTCTL_PATH, defs::ADB_DIR};
         let status = Command::new(BOOTCTL_PATH).arg("hal-info").status()?;
         if !status.success() {
             return Ok(());
@@ -294,7 +311,7 @@ mod android {
         let target_slot = i32::from(current_slot == "0");
 
         Command::new(BOOTCTL_PATH)
-            .arg(format!("set-active-boot-slot {target_slot}"))
+            .args(["set-active-boot-slot", target_slot.to_string().as_str()])
             .status()?;
 
         let post_fs_data = Path::new(ADB_DIR).join("post-fs-data.d");
@@ -310,6 +327,7 @@ rm -f /data/adb/post-fs-data.d/post_ota.sh
         );
 
         std::fs::write(&post_ota_sh, sh_content)?;
+        #[cfg(unix)]
         std::fs::set_permissions(post_ota_sh, std::fs::Permissions::from_mode(0o755))?;
 
         Ok(())
@@ -319,7 +337,7 @@ rm -f /data/adb/post-fs-data.d/post_ota.sh
 #[cfg(target_os = "android")]
 pub use android::*;
 
-fn map_file(file: &Path) -> Result<Mmap> {
+fn map_file(file: &PathBuf) -> Result<Mmap> {
     let mut f = File::open(file).with_context(|| format!("open {}", file.display()))?;
     let len = f
         .seek(SeekFrom::End(0))
@@ -364,15 +382,16 @@ pub fn parse_kmi(buffer: &[u8]) -> Result<String> {
         })
 }
 
-fn parse_kmi_from_kernel(kernel: &Path) -> Result<String> {
+fn parse_kmi_from_kernel(kernel: &PathBuf) -> Result<String> {
     let data = std::fs::read(kernel).context("Failed to read kernel file")?;
+
     parse_kmi(&data)
 }
 
-fn parse_kmi_from_boot(image: &Path) -> Result<String> {
-    let data = map_file(image)?;
-    let boot = BootImage::parse(&data)?;
-    if let Some(kernel) = boot.get_blocks().get_kernel() {
+fn parse_kmi_from_boot(image: &PathBuf) -> Result<String> {
+    let image = map_file(image)?;
+    let bootimage = BootImage::parse(&image)?;
+    if let Some(kernel) = bootimage.get_blocks().get_kernel() {
         let mut output = Vec::<u8>::new();
         kernel.dump(&mut output, false)?;
         parse_kmi(&output)
@@ -415,8 +434,8 @@ fn enforce_bootimage_version(boot: &BootImage<'_>) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::struct_excessive_bools)]
 #[derive(clap::Args, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct BootPatchArgs {
     /// boot image path, if not specified, will try to find the boot image automatically
     #[arg(short, long)]
@@ -449,15 +468,7 @@ pub struct BootPatchArgs {
     #[arg(long, default_value = "false")]
     pub backup: bool,
 
-    /// Output path. If not specified, will use current directory.
-    /// If specified, the boot image will be written to the directory
-    /// even if --flash is specified.
-    #[cfg(target_os = "android")]
-    #[arg(short, long, default_value = None)]
-    pub out: Option<PathBuf>,
-
-    /// Output path. If not specified, will use current directory.
-    #[cfg(not(target_os = "android"))]
+    /// output path, if not specified, will use current directory
     #[arg(short, long, default_value = None)]
     pub out: Option<PathBuf>,
 
@@ -470,20 +481,9 @@ pub struct BootPatchArgs {
     #[arg(long, default_value = None)]
     pub partition: Option<String>,
 
-    /// File name of the output. If specified, the boot image will be
-    /// written to the output directory even if --flash is specified.
-    #[cfg(target_os = "android")]
-    #[arg(long, default_value = None)]
-    pub out_name: Option<String>,
-
     /// File name of the output.
-    #[cfg(not(target_os = "android"))]
     #[arg(long, default_value = None)]
     pub out_name: Option<String>,
-
-    /// Extra cmdline to append to boot image header
-    #[arg(long, default_value = None)]
-    pub cmdline: Option<String>,
 
     /// Always allow shell to get root permission
     #[arg(long, default_value = "false")]
@@ -492,6 +492,10 @@ pub struct BootPatchArgs {
     /// Force enable adbd and disable adbd auth
     #[arg(long, default_value = "false")]
     enable_adbd: bool,
+
+    /// Extra cmdline to append to boot image header
+    #[arg(long, default_value = None)]
+    cmdline: Option<String>,
 
     /// Add more adb_debug prop
     #[arg(long, required = false)]
@@ -504,6 +508,14 @@ pub struct BootPatchArgs {
     /// Do not load custom rc
     #[arg(long, default_value = "false")]
     no_custom_rc: bool,
+
+    /// Block what module loading
+    #[arg(
+        long,
+        value_name = "NAMES",
+        default_value = "vr,vklp,oplus_secure_guard,oplus_secure_guard_new,mkp"
+    )]
+    block_modules: Option<String>,
 
     #[cfg(not(target_os = "android"))]
     #[arg(long, default_value = "aarch64")]
@@ -524,11 +536,12 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
             out,
             kmi,
             out_name,
-            cmdline,
             allow_shell,
             enable_adbd,
             adb_debug_prop,
+            cmdline,
             no_install,
+            block_modules,
             #[cfg(target_os = "android")]
             ota,
             #[cfg(target_os = "android")]
@@ -543,7 +556,14 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
             ramdisk,
         } = args;
 
-        println!(include_str!("banner"));
+        if let Some(modules) = &block_modules {
+            ensure!(
+                valid_block_modules(modules),
+                "blocked preset module list must be at most 255 bytes and contain only letters, digits, '_' or '-'"
+            );
+        }
+
+        println!("{}", banner::print_banner());
 
         #[cfg(target_os = "android")]
         let patch_file = image.is_some();
@@ -583,7 +603,7 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
                 if ota {
                     let slot_suffix = get_slot_suffix(true);
                     println!("- Trying to auto detect KMI version from boot");
-                    return parse_kmi_from_boot(Path::new(&format!(
+                    return parse_kmi_from_boot(&PathBuf::from(&format!(
                         "/dev/block/by-name/boot{slot_suffix}"
                     )));
                 }
@@ -634,17 +654,20 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
         #[cfg(target_os = "android")]
         println!("- Bootdevice: {}", boot_image_file.display());
 
-        // try extract bootctl/busybox
+        // try extract bootctl
         #[cfg(target_os = "android")]
         let _ = assets::ensure_binaries(false);
 
-        println!("- Preparing assets");
-        println!("- Unpacking boot image");
+        println!("- Parsing boot image");
+
         let boot_image_data = map_file(&boot_image_file)?;
-        let boot_image = if ramdisk {
-            BootImage::parse_raw_ramdisk(&boot_image_data)?
+        let boot_image = match if ramdisk {
+            BootImage::parse_raw_ramdisk(&boot_image_data)
         } else {
-            BootImage::parse(&boot_image_data)?
+            BootImage::parse(&boot_image_data)
+        } {
+            Ok(b) => b,
+            Err(e) => bail!("Failed to parse boot iamge, boot image maybe is empty, {e}"),
         };
         enforce_bootimage_version(&boot_image)?;
 
@@ -654,7 +677,6 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
             patcher.override_cmdline(cmdline_value.as_bytes());
             println!("- Set cmdline to: {cmdline_value}");
         }
-
         if let Some(kernel_path) = kernel {
             println!("- Adding Kernel");
             let kernel_data = map_file(&kernel_path)?;
@@ -670,14 +692,18 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
             {
                 println!("- KMI: {kmi}");
                 let name = format!("{kmi}_kernelsu.ko");
-                assets::get_asset(&name).with_context(|| format!("Failed to load {name}"))?
+                Box::new(
+                    assets::get_asset(&name).with_context(|| format!("Failed to load {name}"))?,
+                )
             }
             #[cfg(not(target_os = "android"))]
             {
                 println!("- KMI: {kmi}");
                 println!("- Arch: {arch}");
                 let name = format!("{arch}/{kmi}_kernelsu.ko");
-                assets::get_asset(&name).with_context(|| format!("Failed to load {name}"))?
+                Box::new(
+                    assets::get_asset(&name).with_context(|| format!("Failed to load {name}"))?,
+                )
             }
         };
 
@@ -688,11 +714,14 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
         } else {
             #[cfg(not(target_os = "android"))]
             {
-                assets::get_asset(&format!("{arch}/ksuinit")).context("Failed to load ksuinit")?
+                Box::new(
+                    assets::get_asset(&format!("{arch}/ksuinit"))
+                        .context("Failed to load ksuinit")?,
+                )
             }
             #[cfg(target_os = "android")]
             {
-                assets::get_asset("ksuinit").context("Failed to load ksuinit")?
+                Box::new(assets::get_asset("ksuinit").context("Failed to load ksuinit")?)
             }
         };
 
@@ -765,6 +794,16 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
         // remove legacy config file
         cpio.rm("allow_shell", false);
 
+        if let Some(modules) = block_modules {
+            if !modules.is_empty() {
+                println!("- Blocking modules: {modules}");
+            }
+            cpio.add(
+                KSU_BLOCK_MODULES_CONFIG,
+                CpioEntry::regular(0o644, Box::new(modules.into_bytes())),
+            )?;
+        }
+
         if enable_adbd || adb_debug_prop.is_some() {
             println!("- Adding adb_debug props");
             cpio.add(
@@ -805,7 +844,8 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
         }
 
         println!("- Repacking boot image");
-        let mut new_boot_buf = Cursor::new(Vec::<u8>::with_capacity(boot_image.get_size()));
+
+        let mut new_boot_buf = Cursor::new(Vec::<u8>::new());
         patcher.patch(&mut new_boot_buf)?;
         let new_boot_bytes = new_boot_buf.into_inner();
 
@@ -875,14 +915,7 @@ pub struct BootRestoreArgs {
     #[arg(short, long, default_value = None)]
     pub out: Option<PathBuf>,
 
-    /// File name of the output. If specified, the boot image will be
-    /// written to the output directory even if --flash is specified.
-    #[cfg(target_os = "android")]
-    #[arg(long, default_value = None)]
-    pub out_name: Option<String>,
-
     /// File name of the output.
-    #[cfg(not(target_os = "android"))]
     #[arg(long, default_value = None)]
     pub out_name: Option<String>,
 }
@@ -1036,7 +1069,7 @@ fn rebuild_without_ksu(
         patcher.replace_ramdisk(Box::new(Cursor::new(new_cpio)), false);
     }
 
-    let mut buf = Cursor::new(Vec::<u8>::with_capacity(boot_image.get_size()));
+    let mut buf = Cursor::new(Vec::<u8>::new());
     patcher.patch(&mut buf)?;
     Ok(buf.into_inner())
 }
